@@ -1,229 +1,125 @@
-from decimal import Decimal
-from typing import List, Optional
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from decimal import Decimal
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
-from app.models import (
-    AccountBalance,
-    Market,
-    MarketStatus,
-    Order,
-    OrderSide,
-    OrderStatus,
-    Outcome,
-    User,
-)
+from app.api import deps
+from app import models
+from app.schemas.orders import OrderCreate, OrderResponse, TradeOut
+from app.matching import MatchingEngine
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
-
-# ----- Pydantic Schemas ----- #
-
-class OrderCreate(BaseModel):
-    user_id: int
-    market_id: int
-    outcome_id: int
-    side: OrderSide
-    # price is fraction of 1.0 (e.g. 0.35 = 35 "cents" of payout)
-    price: Decimal = Field(gt=Decimal("0"), lt=Decimal("1"))
-    quantity: int = Field(gt=0)
-    currency: str = Field(default="INR", min_length=1, max_length=10)
+# Single in-memory matching engine instance for the whole app
+engine = MatchingEngine()
 
 
-class OrderRead(BaseModel):
-    id: int
-    user_id: int
-    market_id: int
-    outcome_id: int
-    side: OrderSide
-    price: Decimal
-    quantity: int
-    quantity_filled: int
-    status: OrderStatus
-    is_active: bool
-
-    class Config:
-        from_attributes = True
-
-
-# ----- Internal helpers ----- #
-
-def _get_user_or_404(user_id: int, db: Session) -> User:
-    user = db.query(User).get(user_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found.",
-        )
-    return user
-
-
-def _get_open_market_or_404(market_id: int, db: Session) -> Market:
-    market = db.query(Market).get(market_id)
-    if not market:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Market not found.",
-        )
-    if market.status != MarketStatus.OPEN:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Market is not OPEN (current status: {market.status}).",
-        )
-    return market
-
-
-def _get_outcome_or_404(outcome_id: int, market_id: int, db: Session) -> Outcome:
-    outcome = (
-        db.query(Outcome)
-        .filter(
-            Outcome.id == outcome_id,
-            Outcome.market_id == market_id,
-        )
-        .first()
-    )
-    if not outcome:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Outcome not found for this market.",
-        )
-    return outcome
-
-
-def _get_balance(user_id: int, currency: str, db: Session) -> Optional[AccountBalance]:
-    return (
-        db.query(AccountBalance)
-        .filter(
-            AccountBalance.user_id == user_id,
-            AccountBalance.currency == currency,
-        )
-        .with_for_update(nowait=False)
-        .first()
-    )
-
-
-# ----- Main endpoint: place order ----- #
-
-@router.post(
-    "",
-    response_model=OrderRead,
-    status_code=status.HTTP_201_CREATED,
-)
-def place_order(
-    payload: OrderCreate,
-    db: Session = Depends(get_db),
-) -> OrderRead:
+@router.post("/", response_model=OrderResponse)
+def create_order(
+    order_in: OrderCreate,
+    db: Session = Depends(deps.get_db),
+    current_user=Depends(deps.get_current_user),
+):
     """
-    Place a new order.
+    Place a new order in a given market.
 
-    For now:
-    - Only checks basic risk & state.
-    - Locks required margin in user's account (available -> locked).
-    - Does NOT match orders yet (matching engine will come later).
+    Flow:
+    1. Validate input (e.g. limit orders need a price).
+    2. Ensure market exists.
+    3. Create an Order row in the DB.
+    4. Pass the order to the matching engine -> get list of trades.
+    5. Persist trades in the DB and update this order's remaining quantity.
+    6. Return the order id + list of trades created by this submission.
     """
-    # 1) Validate user & market & outcome
-    _get_user_or_404(payload.user_id, db)
-    market = _get_open_market_or_404(payload.market_id, db)
-    _get_outcome_or_404(payload.outcome_id, market.id, db)
 
-    # 2) Risk/margin calculation
-    currency = payload.currency.upper()
-    price = payload.price
-    qty_dec = Decimal(payload.quantity)
-
-    base_payout = Decimal("1.0")  # per contract
-
-    if payload.side == OrderSide.BUY:
-        required_funds = price * qty_dec * base_payout
-    else:  # SELL
-        required_funds = (base_payout - price) * qty_dec
-
-    if required_funds <= Decimal("0"):
+    # 1) Basic validation: LIMIT orders must have a price
+    if order_in.type == order_in.type.LIMIT and order_in.price is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Required funds computed as non-positive. Check price/quantity.",
+            detail="LIMIT orders must have a price.",
         )
 
-    # 3) Check and update account balance
-    balance = _get_balance(payload.user_id, currency, db)
-    if balance is None:
-        # treat as zero balance if row missing
-        available = Decimal("0.0")
-        locked = Decimal("0.0")
-    else:
-        available = balance.available or Decimal("0.0")
-        locked = balance.locked or Decimal("0.0")
-
-    if available < required_funds:
+    # 2) Ensure market exists
+    market = db.query(models.Market).filter(models.Market.id == order_in.market_id).first()
+    if market is None:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient funds: required {required_funds}, available {available}.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Market {order_in.market_id} not found.",
         )
 
-    # If we reach here, we can lock funds
-    if balance is None:
-        balance = AccountBalance(
-            user_id=payload.user_id,
-            currency=currency,
-            available=available - required_funds,
-            locked=locked + required_funds,
-        )
-        db.add(balance)
-    else:
-        balance.available = available - required_funds
-        balance.locked = locked + required_funds
-
-    # 4) Create the order
-    order = Order(
-        user_id=payload.user_id,
-        market_id=payload.market_id,
-        outcome_id=payload.outcome_id,
-        side=payload.side,
-        price=price,
-        quantity=payload.quantity,
-        quantity_filled=0,
-        status=OrderStatus.OPEN,
-        is_active=True,
+    # 3) Create DB order (persistent representation)
+    # NOTE: If your field names differ, tweak here accordingly.
+    db_order = models.Order(
+        market_id=order_in.market_id,
+        user_id=current_user.id,
+        side=order_in.side.value,   # store "BUY"/"SELL"
+        type=order_in.type.value,   # store "LIMIT"/"MARKET"
+        price=order_in.price,
+        quantity=order_in.quantity,
+        remaining=order_in.quantity,   # make sure your model has this column
     )
-    db.add(order)
-
-    # 5) Commit everything atomically
+    db.add(db_order)
     db.commit()
-    db.refresh(order)
+    db.refresh(db_order)
 
-    return order
+    # 4) Call matching engine (in-memory)
+    trades = engine.submit_order(
+        order_id=str(db_order.id),
+        market_id=str(db_order.market_id),
+        user_id=str(current_user.id),
+        side=order_in.side,
+        order_type=order_in.type,
+        price=order_in.price,
+        quantity=order_in.quantity,
+    )
 
+    # 5) Persist trades in DB and update this order's remaining quantity
+    db_trades: List[models.Trade] = []
+    filled_quantity = Decimal("0")
 
-# ----- Read-only helper endpoints ----- #
-
-@router.get("/{order_id}", response_model=OrderRead)
-def get_order(order_id: int, db: Session = Depends(get_db)) -> OrderRead:
-    """Fetch a single order by ID."""
-    order = db.query(Order).get(order_id)
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found.",
+    for t in trades:
+        # t.buy_order_id and t.sell_order_id are strings; cast to int
+        db_trade = models.Trade(
+            market_id=int(t.market_id),
+            buy_order_id=int(t.buy_order_id),
+            sell_order_id=int(t.sell_order_id),
+            price=t.price,
+            quantity=t.quantity,
         )
-    return order
+        db.add(db_trade)
+        db_trades.append(db_trade)
 
+        # If this order is either the buyer or seller, accumulate its filled qty
+        if t.buy_order_id == str(db_order.id) or t.sell_order_id == str(db_order.id):
+            filled_quantity += t.quantity
 
-@router.get("", response_model=List[OrderRead])
-def list_orders(
-    user_id: Optional[int] = Query(default=None),
-    market_id: Optional[int] = Query(default=None),
-    db: Session = Depends(get_db),
-) -> list[OrderRead]:
-    """
-    List orders, optionally filtered by user_id and/or market_id.
-    """
-    q = db.query(Order)
-    if user_id is not None:
-        q = q.filter(Order.user_id == user_id)
-    if market_id is not None:
-        q = q.filter(Order.market_id == market_id)
-    q = q.order_by(Order.id)
-    return q.all()
+    db.commit()
+    for db_trade in db_trades:
+        db.refresh(db_trade)
+
+    # Update remaining quantity on the DB order
+    db_order.remaining = db_order.quantity - filled_quantity
+    db.commit()
+    db.refresh(db_order)
+
+    # 6) Build response model
+    trades_out: List[TradeOut] = [
+        TradeOut(
+            id=str(tr.id),
+            market_id=str(tr.market_id),
+            buy_order_id=str(tr.buy_order_id),
+            sell_order_id=str(tr.sell_order_id),
+            price=tr.price,
+            quantity=tr.quantity,
+            executed_at=tr.executed_at,
+        )
+        for tr in db_trades
+    ]
+
+    return OrderResponse(
+        order_id=str(db_order.id),
+        trades=trades_out,
+    )
