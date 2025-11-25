@@ -26,3 +26,4 @@ exchange.db
 .mypy_cache/
 .cache/
 terminal.txt
+.env
