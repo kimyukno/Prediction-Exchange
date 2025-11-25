@@ -29,14 +29,14 @@ def upgrade() -> None:
     sa.Column('status', sa.Enum('DRAFT', 'OPEN', 'PAUSED', 'RESOLVED', 'CANCELLED', name='market_status'), server_default='DRAFT', nullable=False),
     sa.Column('trading_close_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('settle_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP()'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_markets_slug'), 'markets', ['slug'], unique=True)
     op.create_table('users',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('email', sa.String(), nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP()'), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
@@ -62,22 +62,19 @@ def upgrade() -> None:
     sa.UniqueConstraint('market_id', 'code', name='uq_market_outcome_code')
     )
     op.create_table('orders',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=False),
-    sa.Column('market_id', sa.Integer(), nullable=False),
-    sa.Column('outcome_id', sa.Integer(), nullable=False),
-    sa.Column('side', sa.Enum('BUY', 'SELL', name='order_side'), nullable=False),
-    sa.Column('price', sa.Numeric(precision=6, scale=4), nullable=False),
-    sa.Column('quantity', sa.Integer(), nullable=False),
-    sa.Column('quantity_filled', sa.Integer(), nullable=False),
-    sa.Column('status', sa.Enum('OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', name='order_status'), server_default='OPEN', nullable=False),
-    sa.Column('is_active', sa.Boolean(), server_default='true', nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP()'), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP()'), nullable=False),
-    sa.ForeignKeyConstraint(['market_id'], ['markets.id'], ondelete='CASCADE'),
-    sa.ForeignKeyConstraint(['outcome_id'], ['outcomes.id'], ondelete='CASCADE'),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
-    sa.PrimaryKeyConstraint('id')
+    sa.Column('id', sa.Integer, primary_key=True),
+    sa.Column('user_id', sa.Integer, sa.ForeignKey('users.id'), nullable=False),
+    sa.Column('market_id', sa.Integer, sa.ForeignKey('markets.id'), nullable=False),
+    sa.Column('outcome_id', sa.Integer, sa.ForeignKey('outcomes.id'), nullable=False),
+    sa.Column('side', sa.String(4), nullable=False),
+    sa.Column('price', sa.Numeric(6, 4), nullable=False),
+    sa.Column('quantity', sa.Integer, nullable=False),
+    sa.Column('quantity_filled', sa.Integer, nullable=False, server_default='0'),
+    sa.Column('order_type', sa.String(10), nullable=False, server_default='LIMIT'),
+    sa.Column('status', sa.String(16), nullable=False, server_default='OPEN'),
+    sa.Column('is_active', sa.Boolean, nullable=False, server_default=sa.text('1')),
+    sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.text('CURRENT_TIMESTAMP')),
+    sa.Column('updated_at', sa.DateTime(), nullable=False, server_default=sa.text('CURRENT_TIMESTAMP')),
     )
     op.create_table('trades',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -87,7 +84,7 @@ def upgrade() -> None:
     sa.Column('sell_order_id', sa.Integer(), nullable=True),
     sa.Column('price', sa.Numeric(precision=6, scale=4), nullable=False),
     sa.Column('quantity', sa.Integer(), nullable=False),
-    sa.Column('executed_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP()'), nullable=False),
+    sa.Column('executed_at', sa.DateTime(timezone=True), server_default=sa.text('CURRENT_TIMESTAMP'), nullable=False),
     sa.ForeignKeyConstraint(['buy_order_id'], ['orders.id'], ondelete='SET NULL'),
     sa.ForeignKeyConstraint(['market_id'], ['markets.id'], ondelete='CASCADE'),
     sa.ForeignKeyConstraint(['outcome_id'], ['outcomes.id'], ondelete='CASCADE'),
