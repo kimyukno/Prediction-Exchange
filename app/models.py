@@ -135,10 +135,13 @@ class AccountBalance(Base):
 
 # ----- ORDERS & TRADES ----- #
 
+# ----- ORDERS & TRADES -----
+
 class Order(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True)
+
     user_id = Column(
         Integer,
         ForeignKey("users.id", ondelete="CASCADE"),
@@ -155,11 +158,15 @@ class Order(Base):
         nullable=False,
     )
 
+    # "BUY" / "SELL"
     side = Column(Enum(OrderSide, name="order_side"), nullable=False)
 
     price = Column(Numeric(6, 4), nullable=False)
     quantity = Column(Integer, nullable=False)
     quantity_filled = Column(Integer, nullable=False, default=0)
+
+    # NEW: order type in the DB – stores "LIMIT" / "MARKET"
+    order_type = Column(String(10), nullable=False, server_default="LIMIT")
 
     status = Column(
         Enum(OrderStatus, name="order_status"),
@@ -171,19 +178,21 @@ class Order(Base):
 
     created_at = Column(
         DateTime(timezone=True),
-        server_default=func.now(),
         nullable=False,
+        server_default=func.now(),
     )
     updated_at = Column(
         DateTime(timezone=True),
+        nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
-        nullable=False,
     )
 
+    # Relationships
     user = relationship("User", back_populates="orders")
     market = relationship("Market", back_populates="orders")
     outcome = relationship("Outcome")
+
     buy_trades = relationship(
         "Trade",
         back_populates="buy_order",

@@ -1,21 +1,28 @@
-# Virtual envs
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
 .venv/
 venv/
 env/
 
-# Python cache
-__pycache__/
-*.py[cod]
+# Local DB + state
+exchange.db
+*.sqlite3
 
-# Environment / secrets
-.env
-*.env
-env.env
-
-# Editors / IDEs
+# IDE / editor junk
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Logs / scratch
+# Python tooling
 *.log
+.pytest_cache/
+.mypy_cache/
+.cache/
 terminal.txt
